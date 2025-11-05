@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sistema de Asistencia QR</title>
+    <style>
+        body { font-family: system-ui, -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #f0f2f5; color: #333; }
+        h1 { text-align: center; color: #444; }
+        .card { background: white; padding: 20px; border-radius: 16px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); margin-bottom: 25px; }
+        h2 { margin-top: 0; color: #007AFF; font-size: 1.4rem; }
+        input, button { width: 100%; padding: 12px; margin: 8px 0; border-radius: 10px; border: 1px solid #ddd; box-sizing: border-box; font-size: 16px; }
+        button { border: none; cursor: pointer; font-weight: 600; transition: transform 0.1s, opacity 0.2s; color: white; }
+        button:active { transform: scale(0.96); }
+        button:hover { opacity: 0.9; }
+        #qr-reader { width: 100%; border-radius: 12px; overflow: hidden; }
+        #scan-status { text-align: center; font-weight: bold; margin-top: 15px; padding: 10px; border-radius: 8px; background: #f9f9f9; }
+        .log-item { padding: 12px; border-bottom: 1px solid #eee; font-size: 0.95em; }
+        .log-item:last-child { border-bottom: none; }
+        .timestamp { color: #999; font-size: 0.85em; display: block; margin-top: 4px; }
+        .btn-group { display: flex; gap: 10px; margin-top: 15px; }
+        .btn-group button { flex: 1; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <script src="https://unpkg.com/html5-qrcode"></script>
+</head>
+<body>
+
+    <h1>📱 Control de Acceso QR</h1>
+
+    <div class="card">
+        <h2>1. Generar QR de Prueba</h2>
+        <textarea id="text-input" rows="5" style="width: 100%; padding: 10px; border-radius: 10px; border: 1px solid #ddd; font-family: monospace;" placeholder='Pega aquí tu JSON, ej: {"matricula": "A1", "nombre": "Juan", "paymentStatus": true...}'></textarea>
+        <div id="qrcode" style="margin-top:20px; display: flex; justify-content: center;"></div>
+    </div>
+
+    <div class="card">
+        <h2>2. Escáner de Acceso</h2>
+        <div id="qr-reader"></div>
+        <p id="scan-status">📷 Esperando cámara...</p>
+    </div>
+
+    <div class="card">
+        <h2>3. Registros de Asistencia</h2>
+        <button onclick="cargarRegistros()" style="background-color: #007AFF; margin-bottom: 0;">🔄 Actualizar Lista</button>
+        
+        <div id="log-container" style="max-height: 350px; overflow-y: auto; margin-top: 15px; border: 1px solid #eee; border-radius: 12px; background: #fafafa;"></div>
+
+        <div class="btn-group">
+            <button onclick="descargarExcelCSV()" style="background-color: #34C759;">📊 Descargar Excel</button>
+            <button onclick="vaciarRegistros()" style="background-color: #FF3B30;">🗑️ Borrar Todo</button>
+        </div>
+    </div>
+
+    <script>
+        // --- A. GENERADOR QR ---
+        const qrContainer = document.getElementById("qrcode");
+        let qrCode = new QRCode(qrContainer, { width: 180, height: 180 });
+
+        document.getElementById("text-input").addEventListener("input", (e) => {
+            const text = e.target.value.trim();
+            if (text) {
+                qrCode.makeCode(text);
+            } else {
+                qrCode.clear(); // Limpia si está vacío
+                qrContainer.innerHTML = ""; // Asegura limpieza visual si la librería falla al limpiar
+            }
+        });
+
+        // --- B. ESCÁNER Y VALIDACIÓN ---
+        let isProcessing = false;
+        let lastScannedText = "";
+        const statusText = document.getElementById("scan-status");
+
+        function onScanSuccess(decodedText, decodedResult) {
+            if (isProcessing) return;
+            // Evita re-leer el mismo código inmediatamente si no ha pasado tiempo suficiente
+            if (decodedText === lastScannedText) return;
+
+            isProcessing = true;
+            lastScannedText = decodedText;
+            statusText.innerText = "⏳ Verificando...";
+            statusText.style.backgroundColor = "#fff3cd"; // Amarillo claro
+
+            try {
+                const data = JSON.parse(decodedText);
+
+                // 1. Validar campos requeridos
+                const requeridos = ['matricula', 'nombre', 'apellido', 'grado', 'grupo', 'paymentStatus', 'procedencia'];
+                const faltantes = requeridos.filter(campo => !data.hasOwnProperty(campo));
+                if (faltantes.length > 0) throw new Error("Faltan datos: " + faltantes.join(', '));
+
+                // 2. Verificar PAGO
+                if (data.paymentStatus !== true && data.paymentStatus !== "pagado") {
+                    mostrarEstado(`❌ PAGO PENDIENTE: ${data.nombre} ${data.apellido}`, "#f8d7da", "#721c24");
+                    liberarEscaner(2500);
+                    return;
+                }
+
+                // 3. ÉXITO: Enviar al servidor
+                mostrarEstado(`✅ ACCESO CONCEDIDO: ${data.nombre} ${data.apellido}`, "#d4edda", "#155724");
+                
+                fetch('/api/escanear', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ contenido: decodedText })
+                })
+                .then(res => res.json())
+                .then(() => {
+                    cargarRegistros();
+                    liberarEscaner(2000);
+                });
+
+            } catch (e) {
+                mostrarEstado("⚠️ QR INVÁLIDO para este sistema", "#fff3cd", "#856404");
+                liberarEscaner(2000);
+            }
+        }
+
+        function mostrarEstado(mensaje, bgColor, textColor) {
+            statusText.innerHTML = `<strong>${mensaje}</strong>`;
+            statusText.style.backgroundColor = bgColor;
+            statusText.style.color = textColor;
+        }
+
+        function liberarEscaner(tiempo) {
+            setTimeout(() => {
+                isProcessing = false;
+                statusText.innerHTML = "📷 Listo para escanear";
+                statusText.style.backgroundColor = "#f9f9f9";
+                statusText.style.color = "#333";
+            }, tiempo);
+        }
+
+        const html5QrcodeScanner = new Html5QrcodeScanner("qr-reader", { fps: 10, qrbox: 250, disableFlip: false }, false);
+        html5QrcodeScanner.render(onScanSuccess, (err) => {}); // Error handler vacío para no saturar la consola
+
+        // --- C. GESTIÓN DE REGISTROS ---
+        let registrosActuales = [];
+
+        function cargarRegistros() {
+            fetch('/api/registros')
+                .then(res => res.json())
+                .then(data => {
+                    registrosActuales = data;
+                    const container = document.getElementById('log-container');
+                    if (data.length === 0) {
+                         container.innerHTML = '<p style="padding: 15px; text-align: center; color: #999;">Sin registros aún.</p>';
+                         return;
+                    }
+                    let html = '';
+                    data.forEach(reg => {
+                        try {
+                            const d = JSON.parse(reg.contenido);
+                            html += `
+                                <div class="log-item">
+                                    <strong>${d.nombre} ${d.apellido}</strong> (${d.matricula})<br>
+                                    <span class="timestamp">📅 ${reg.fecha} | 🏫 ${d.grado} ${d.grupo}</span>
+                                </div>`;
+                        } catch (e) {
+                            html += `<div class="log-item" style="color:red;">Error datos corruptos <span class="timestamp">${reg.fecha}</span></div>`;
+                        }
+                    });
+                    container.innerHTML = html;
+                })
+                .catch(err => console.error("Error al cargar registros:", err));
+        }
+
+        function descargarExcelCSV() {
+            if (registrosActuales.length === 0) return alert("No hay datos para descargar.");
+            
+            let csv = "Matrícula,Nombre,Apellido,Grado,Grupo,Estatus Pago,Procedencia,Fecha Escaneo\n";
+            registrosActuales.forEach(reg => {
+                try {
+                    const d = JSON.parse(reg.contenido);
+                    const pago = (d.paymentStatus === true || d.paymentStatus === "pagado") ? 'PAGADO' : 'PENDIENTE';
+                    csv += `"${d.matricula}","${d.nombre}","${d.apellido}","${d.grado}","${d.grupo}","${pago}","${d.procedencia}","${reg.fecha}"\n`;
+                } catch (e) { csv += `"ERROR","Datos corruptos","","","","","","${reg.fecha}"\n`; }
+            });
+
+            const blob = new Blob(["\uFEFF" + csv], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `Asistencia_${new Date().toISOString().slice(0,10)}.csv`;
+            document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        }
+
+        function vaciarRegistros() {
+            if (confirm("¿BORRAR TODOS los registros? No se puede deshacer.")) {
+                fetch('/api/registros', { method: 'DELETE' })
+                    .then(res => res.json())
+                    .then(data => { if(data.success) cargarRegistros(); });
+            }
+        }
+
+        // Inicio
+        cargarRegistros();
+    </script>
+</body>
+</html>
